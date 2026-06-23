@@ -1,196 +1,299 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 
-# App Title and Description
-st.set_page_config(page_title="Brewing Water & pH Calculator", layout="centered")
-st.title("🍺 FiferDave's Brewing Salts & Mash pH Calculator")
-st.write("Optimize brewing salts (excluding MgCl₂) and calculate precise mash acid additions.")
+# -----------------------------
+# CONFIG
+# -----------------------------
+st.set_page_config(page_title="Scottish Brewing Water Calculator", layout="centered")
+st.title("🍺 Scottish Brewing Water Calculator")
 
-# --- SIDEBAR INPUTS ---
-st.sidebar.header("🪣 Batch Settings")
-volume_liters = st.sidebar.number_input("Total Water Volume (Litre)", min_value=1.0, value=20.0, step=0.5)
+# -----------------------------
+# LOAD DATA
+# -----------------------------
+@st.cache_data
+def load_scottish():
+    df = pd.read_excel("scottish water profiles for brewing.xlsx", engine="openpyxl")
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-st.sidebar.header("💧 Base Water Profile (ppm)")
-base_Ca = st.sidebar.number_input("Base Calcium (Ca)", min_value=0.0, value=10.0)
-base_Mg = st.sidebar.number_input("Base Magnesium (Mg)", min_value=0.0, value=2.0)
-base_Na = st.sidebar.number_input("Base Sodium (Na)", min_value=0.0, value=5.0)
-base_Cl = st.sidebar.number_input("Base Chloride (Cl)", min_value=0.0, value=8.0)
-base_SO4 = st.sidebar.number_input("Base Sulfate (SO4)", min_value=0.0, value=10.0)
-# Alkalinity measured as Bicarbonate (HCO3) for pH modeling
-base_HCO3 = st.sidebar.number_input("Base Bicarbonate (HCO3)", min_value=0.0, value=30.0, help="If report gives Total Alkalinity as CaCO3, multiply by 1.22")
+@st.cache_data
+def load_world():
+    df = pd.read_excel("worldwide water profiles.xlsx", engine="openpyxl")
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-# --- GRAIN BILL CONFIGURATION ---
-st.sidebar.header("🌾 Grain Bill & Mash")
-weight_base = st.sidebar.number_input("Base Malts (kg)", min_value=0.0, value=4.0, step=0.1, help="Pilsner, Pale, Vienna, Munich, Wheat, etc.")
-weight_crystal = st.sidebar.number_input("Crystal / Caramel Malts (kg)", min_value=0.0, value=0.5, step=0.1, help="CaraPils, Crystal 40, Crystal 120, etc.")
-weight_roasted = st.sidebar.number_input("Roasted Malts / Grains (kg)", min_value=0.0, value=0.2, step=0.05, help="Chocolate Malt, Roasted Barley, Black Malt")
+scot = load_scottish()
+world = load_world()
 
-st.sidebar.subheader("🧪 Acid Options")
-acid_type = st.sidebar.selectbox("Select Mash Acid:", ["Lactic Acid Powder (100%)", "Lactic Acid Liquid (80%)", "Phosphoric Acid (10%)"])
+# -----------------------------
+# pH GAUGE
+# -----------------------------
+def plot_ph_gauge(ph_value):
+    fig, ax = plt.subplots(figsize=(6, 1.2))
 
-# --- EXPANDED TARGET PROFILES DATABASE ---
-st.header("🎯 Target Water Profile Selection")
+    ax.axvspan(5.0, 5.2, color="red", alpha=0.3)
+    ax.axvspan(5.2, 5.6, color="green", alpha=0.3)
+    ax.axvspan(5.6, 5.8, color="orange", alpha=0.3)
 
-style_profiles = {
-    "Custom Profile (Manual Input)": {"Ca": 80.0, "Mg": 5.0, "Na": 25.0, "Cl": 90.0, "SO4": 90.0},
-    "Historic: Pilsen (Soft / Pale Lager)": {"Ca": 7.0, "Mg": 2.0, "Na": 2.0, "Cl": 5.0, "SO4": 5.0},
-    "Historic: Burton-on-Trent (Pale Ale / IPA)": {"Ca": 268.0, "Mg": 62.0, "Na": 30.0, "Cl": 36.0, "SO4": 820.0},
-    "Historic: London (Malty Porter / Stout)": {"Ca": 52.0, "Mg": 16.0, "Na": 86.0, "Cl": 60.0, "SO4": 32.0},
-    "Historic: Dublin (Dry Irish Stout)": {"Ca": 115.0, "Mg": 4.0, "Na": 12.0, "Cl": 19.0, "SO4": 55.0},
-    "Historic: Munich (Märzen / Amber Lager)": {"Ca": 75.0, "Mg": 18.0, "Na": 2.0, "Cl": 30.0, "SO4": 40.0},
-    "Historic: Dortmund (Export Pale Lager)": {"Ca": 250.0, "Mg": 23.0, "Na": 70.0, "Cl": 100.0, "SO4": 280.0},
-    "Historic: Edinburgh (Scottish / Shilling Ales)": {"Ca": 120.0, "Mg": 25.0, "Na": 55.0, "Cl": 20.0, "SO4": 140.0},
-    "Modern Style: NEIPA (Juicy / Hazy)": {"Ca": 80.0, "Mg": 5.0, "Na": 15.0, "Cl": 150.0, "SO4": 75.0},
-    "Modern Style: West Coast IPA (Crisp / Bitter)": {"Ca": 100.0, "Mg": 10.0, "Na": 15.0, "Cl": 50.0, "SO4": 200.0},
-    "Modern Style: Light & Hoppy (Pale Ale / Blonde)": {"Ca": 75.0, "Mg": 5.0, "Na": 10.0, "Cl": 50.0, "SO4": 150.0},
-    "Modern Style: Light & Malty (Helles / Kölsch)": {"Ca": 60.0, "Mg": 5.0, "Na": 10.0, "Cl": 95.0, "SO4": 55.0},
-    "Modern Style: Dark & Balanced (Brown / Stout)": {"Ca": 150.0, "Mg": 10.0, "Na": 80.0, "Cl": 150.0, "SO4": 160.0},
-    "Modern Style: Belgian Ale (Saison / Dubbel)": {"Ca": 120.0, "Mg": 10.0, "Na": 20.0, "Cl": 75.0, "SO4": 75.0}
-}
+    ax.axvline(ph_value, color="black", linewidth=3)
 
-selected_style = st.selectbox("Choose your target baseline:", list(style_profiles.keys()))
-defaults = style_profiles[selected_style]
+    ax.set_xlim(5.0, 5.8)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    ax.set_xticks([5.0, 5.2, 5.4, 5.6, 5.8])
+    ax.set_xlabel("Mash pH")
 
-st.write("👉 *You can manually tweak these numbers below after choosing a preset if needed:*")
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1: target_Ca = st.number_input("Target Ca", min_value=0.0, value=float(defaults["Ca"]))
-with col2: target_Mg = st.number_input("Target Mg", min_value=0.0, value=float(defaults["Mg"]))
-with col3: target_Na = st.number_input("Target Na", min_value=0.0, value=float(defaults["Na"]))
-with col4: target_Cl = st.number_input("Target Cl", min_value=0.0, value=float(defaults["Cl"]))
-with col5: target_SO4 = st.number_input("Target SO4", min_value=0.0, value=float(defaults["SO4"]))
+    return fig
 
-# --- THE CALCULATOR LOGIC ---
-base_water = {'Ca': base_Ca, 'Mg': base_Mg, 'Na': base_Na, 'Cl': base_Cl, 'SO4': base_SO4}
-target_water = {'Ca': target_Ca, 'Mg': target_Mg, 'Na': target_Na, 'Cl': target_Cl, 'SO4': target_SO4}
+# -----------------------------
+# WATER
+# -----------------------------
+st.sidebar.header("🪣 Water Volumes")
 
-delta_ppm = np.array([
-    max(0, target_water['Ca'] - base_water['Ca']),
-    max(0, target_water['Mg'] - base_water['Mg']),
-    max(0, target_water['Na'] - base_water['Na']),
-    max(0, target_water['Cl'] - base_water['Cl']),
-    max(0, target_water['SO4'] - base_water['SO4'])
-])
+mash_water = st.sidebar.number_input("Mash Water (L)", 0.0, 100.0, 15.0)
+sparge_water = st.sidebar.number_input("Sparge Water (L)", 0.0, 100.0, 10.0)
+total_water = mash_water + sparge_water
 
-salt_matrix = np.array([
-    [232.8,  0.0,  0.0,   0.0, 557.9],  # Gypsum
-    [272.6,  0.0,  0.0, 482.2,   0.0],  # Calcium Chloride
-    [  0.0, 98.6,  0.0,   0.0, 389.6],  # Epsom Salt
-    [  0.0,  0.0, 273.7,  0.0,   0.0],  # Baking Soda
-    [  0.0,  0.0, 393.4, 606.6,   0.0]   # Canning Salt
+st.sidebar.markdown(f"**Total Water: {total_water:.1f} L**")
+
+# -----------------------------
+# BASE WATER
+# -----------------------------
+st.sidebar.header("💧 Base Water")
+
+loc = st.sidebar.selectbox("Water Source Scotland - https://www.scottishwater.co.uk/your-home/your-water/water-quality/water-quality", sorted(scot["Location"].dropna()))
+row = scot[scot["Location"] == loc].iloc[0]
+
+st.sidebar.markdown("### Base Water Profile (ppm)")
+
+base_Ca = st.sidebar.number_input("Calcium (Ca)", 0.0, 500.0, float(row["Calcium"]))
+base_Mg = st.sidebar.number_input("Magnesium (Mg)", 0.0, 100.0, float(row["Magnesium"]))
+base_Na = st.sidebar.number_input("Sodium (Na)", 0.0, 200.0, float(row["Sodium"]))
+base_Cl = st.sidebar.number_input("Chloride (Cl)", 0.0, 500.0, float(row["Chloride"]))
+base_SO4 = st.sidebar.number_input("Sulphate (SO₄)", 0.0, 500.0, float(row["Sulphate"]))
+base_HCO3 = st.sidebar.number_input("Bicarbonate (HCO₃)", 0.0, 500.0, float(row["HCO3"]))
+
+# Base water inputs above...
+
+st.sidebar.caption(
+    f"Ca:{base_Ca:.0f} Mg:{base_Mg:.0f} Na:{base_Na:.0f} "
+    f"Cl:{base_Cl:.0f} SO₄:{base_SO4:.0f} HCO₃:{base_HCO3:.0f}"
+)
+
+# -----------------------------
+# TARGET PROFILE
+# -----------------------------
+st.header("🎯 Target Profile")
+
+profile_list = sorted(world["Location"].dropna())
+profile_name = st.selectbox("Choose target profile:", profile_list)
+
+prow = world[world["Location"] == profile_name].iloc[0]
+
+st.markdown("### Target Water Profile (ppm)")
+
+target_Ca = st.number_input("Calcium (Ca)", 0.0, 300.0, float(prow["Calcium"]))
+target_Mg = st.number_input("Magnesium (Mg)", 0.0, 100.0, float(prow["Magnesium"]))
+target_Na = st.number_input("Sodium (Na)", 0.0, 200.0, float(prow["Sodium"]))
+target_Cl = st.number_input("Chloride (Cl)", 0.0, 500.0, float(prow["Chloride"]))
+target_SO4 = st.number_input("Sulphate (SO₄)", 0.0, 500.0, float(prow["Sulphate"]))
+
+# Target inputs above...
+
+st.caption(
+    f"Ca:{target_Ca:.0f} Mg:{target_Mg:.0f} Na:{target_Na:.0f} "
+    f"Cl:{target_Cl:.0f} SO₄:{target_SO4:.0f}"
+)
+
+# -----------------------------
+# SALTS
+# -----------------------------
+base = np.array([base_Ca, base_Mg, base_Na, base_Cl, base_SO4])
+target = np.array([target_Ca, target_Mg, target_Na, target_Cl, target_SO4])
+
+delta = np.maximum(target - base, 0)
+
+matrix = np.array([
+    [232.8, 0, 0, 0, 557.9],
+    [272.6, 0, 0, 482.2, 0],
+    [0, 98.6, 0, 0, 389.6],
+    [0, 0, 273.7, 0, 0],
+    [0, 0, 393.4, 606.6, 0]
 ]).T
 
-def objective(salts_g_per_l):
-    achieved_ppm = np.dot(salt_matrix, salts_g_per_l)
-    return np.sum((achieved_ppm - delta_ppm) ** 2)
+def obj(x):
+    return np.sum((np.dot(matrix, x) - delta) ** 2)
 
-result = minimize(objective, [0.1]*5, bounds=[(0, None) for _ in range(5)], method='L-BFGS-B')
-total_grams = result.x * volume_liters
-achieved_deltas = np.dot(salt_matrix, result.x)
+res = minimize(obj, [0.1]*5, bounds=[(0, None)]*5)
+salts = res.x * total_water
 
-# Extract salt modifications to compute final post-salt ion concentrations cleanly
-final_profile = {}
-profile_keys = ['Ca', 'Mg', 'Na', 'Cl', 'SO4']
-for i, k in enumerate(profile_keys):
-    final_profile[k] = base_water[k] + achieved_deltas[i]
+salt_names = ["Gypsum", "Calcium Chloride", "Epsom", "Baking Soda", "Salt"]
 
-# Baking soda adds bicarbonate alkalinity (1g/L adds 726 ppm HCO3)
-baking_soda_g_per_l = result.x[3]
-final_HCO3 = base_HCO3 + (baking_soda_g_per_l * 726.0)
+st.header("⚖️ Salt Additions")
 
-# --- DISPLAY RESULTS ---
-st.header("⚖️ Required Salt Additions")
-salt_names = [
-    "Gypsum (Calcium Sulfate)", 
-    "Calcium Chloride", 
-    "Epsom Salt (Magnesium Sulfate)", 
-    "Baking Soda (Sodium Bicarbonate)", 
-    "Canning Salt (Sodium Chloride)"
-]
+for name, grams in zip(salt_names, salts):
+    st.write(f"{name}: {grams:.2f} g")
 
-for name, grams in zip(salt_names, total_grams):
-    if grams > 0.01:
-        st.success(f"Add **{grams:.2f} grams** of {name}")
-    else:
-        st.info(f"0.00 grams of {name} required")
+st.write("**Base vs Target Comparison**")
 
-# --- MASH pH & ACID CALCULATIONS ---
-st.header("🧪 Mash pH Prediction & Acid Adjustment")
+comparison = pd.DataFrame({
+    "Ion": ["Ca", "Mg", "Na", "Cl", "SO₄"],
+    "Base": [base_Ca, base_Mg, base_Na, base_Cl, base_SO4],
+    "Target": [target_Ca, target_Mg, target_Na, target_Cl, target_SO4]
+})
 
-total_grain_kg = weight_base + weight_crystal + weight_roasted
+st.table(comparison)
 
-if total_grain_kg > 0:
-    # 1. Base grain distilled water pH assumes 5.75.
-    grain_ph_drop = ((weight_crystal * 0.25) + (weight_roasted * 0.55)) / total_grain_kg
-    distilled_mash_ph = 5.75 - grain_ph_drop
+# -----------------------------
+# ACID SETTINGS
+# -----------------------------
+st.sidebar.header("🧪 Acid Settings")
 
-    # 2. Account for Residual Alkalinity (RA) of adjusted water
-    alkalinity_mEq = (final_HCO3 / 61.0)
-    ca_mEq = (final_profile['Ca'] / 20.0)
-    mg_mEq = (final_profile['Mg'] / 12.1)
-    residual_alkalinity_mEq = alkalinity_mEq - (ca_mEq / 3.5) - (mg_mEq / 7.0)
+acid_mode = st.sidebar.radio(
+    "Apply Acid To:",
+    ["Mash Only", "Sparge Only", "Mash + Sparge"]
+)
 
-    # RA shifts pH upward
-    estimated_unadjusted_ph = distilled_mash_ph + (residual_alkalinity_mEq * 0.056)
-    
-    target_ph = 5.40
-    ph_difference = estimated_unadjusted_ph - target_ph
-    
-    st.subheader(f"Predicted Unadjusted Mash pH: {estimated_unadjusted_ph:.2f}")
+acid_type = st.sidebar.selectbox(
+    "Acid Type",
+    [
+        "Lactic Acid (liquid)",
+        "Lactic Acid (powder)",
+        "Phosphoric Acid",
+        "Custom Acid"
+    ]
+)
 
-    if ph_difference > 0:
-        required_mEq_total = ph_difference * 35.0 * total_grain_kg
-        
-        if acid_type == "Lactic Acid Powder (100%)":
-            acid_needed = required_mEq_total / 11.1
-            unit = "grams"
-            taste_warning_limit = volume_liters * 0.27 
-        elif acid_type == "Lactic Acid Liquid (80%)":
-            acid_needed = required_mEq_total / 11.2
-            unit = "mL"
-            taste_warning_limit = volume_liters * 0.25
-        else:
-            acid_needed = required_mEq_total / 3.0
-            unit = "mL"
-            taste_warning_limit = float('inf')
+st.sidebar.subheader("Acid Concentration")
 
-        if acid_needed < 0.05:
-            st.info("✨ Your mash pH is perfectly hitting the target zone. No acid additions required!")
-        else:
-            st.warning(f"🎯 To drop pH from {estimated_unadjusted_ph:.2f} to {target_ph:.2f}: Add **{acid_needed:.2f} {unit}** of {acid_type}")
-            
-            if "Lactic" in acid_type and acid_needed > taste_warning_limit:
-                st.error(f"⚠️ Warning: Lactic concentration exceeds optimal flavor threshold for your volume. Consider cutting base water with RO/Distilled water to lower starting bicarbonate alkalinity.")
-    else:
-        st.success(f"✨ Your mash pH is predicted at {estimated_unadjusted_ph:.2f}. Dark malts have buffered your water cleanly. No acid additions required!")
+if acid_type == "Lactic Acid (liquid)":
+    acid_percent = st.sidebar.number_input("Concentration (%)", 50.0, 100.0, 80.0)
+
+elif acid_type == "Lactic Acid (powder)":
+    acid_percent = 100.0
+    st.sidebar.caption("Pure lactic acid (100%)")
+
+elif acid_type == "Phosphoric Acid":
+    acid_percent = st.sidebar.number_input("Concentration (%)", 5.0, 85.0, 10.0)
+
 else:
-    st.info("ℹ️ Enter grain weights in the sidebar to calculate mash pH updates.")
+    acid_percent = st.sidebar.number_input("Custom Acid (%)", 1.0, 100.0, 80.0)
 
-# --- DISPLAY MINERAL PROFILE TABLES ---
-st.header("📊 Final Water Profile Comparison")
-ions = ['Calcium (Ca)', 'Magnesium (Mg)', 'Sodium (Na)', 'Chloride (Cl)', 'Sulfate (SO4)']
+strength = acid_percent / 80.0
 
-table_data = []
-for ion, k in zip(ions, profile_keys):
-    table_data.append({
-        "Mineral Ion": ion,
-        "Base (ppm)": f"{base_water[k]:.1f}",
-        "Target (ppm)": f"{target_water[k]:.1f}",
-        "Achieved (ppm)": f"{final_profile[k]:.1f}"
-    })
+if "phosphoric" in acid_type.lower():
+    strength *= 0.4
 
-st.table(table_data)
+st.sidebar.caption(f"Relative strength vs 80% lactic: {strength:.2f}")
 
-# Quality Checks & Feedback using pure isolated values
-achieved_SO4 = final_profile['SO4']
-achieved_Cl = final_profile['Cl']
+# -----------------------------
+# GRAIN
+# -----------------------------
+st.sidebar.header("🌾 Grain Bill")
 
-if achieved_SO4 > 0:
-    ratio = achieved_Cl / achieved_SO4
-    st.subheader(f"Chloride to Sulfate Ratio: {ratio:.2f}")
-    if ratio > 2.0: 
-        st.info("🎯 Flavor Balance: Highly **Malty** profile. Perfect for accentuating roundness, sweetness, and fullness.")
-    elif ratio < 0.5: 
-        st.info("🎯 Flavor Balance: Highly **Bitter & Hoppy** profile. Perfect for accentuating clean crispness and intense hop bite.")
-    else: 
-        st.info("🎯 Flavor Balance: **Balanced** profile. Good general-purpose presentation for malt and hop expression.")
+base_malt = st.sidebar.number_input(
+    "Base Malt (kg)",
+    min_value=0.0,
+    max_value=20.0,
+    value=4.0,
+    step=0.05
+)
+
+crystal = st.sidebar.number_input(
+    "Crystal (kg)",
+    min_value=0.0,
+    max_value=10.0,
+    value=0.5,
+    step=0.05
+)
+
+roast = st.sidebar.number_input(
+    "Roasted (kg)",
+    min_value=0.0,
+    max_value=10.0,
+    value=0.2,
+    step=0.05
+)
+
+
+grain_total = base_malt + crystal + roast
+
+# -----------------------------
+# MASH pH
+# -----------------------------
+if grain_total > 0:
+
+    grain_effect = ((crystal * 0.25) + (roast * 0.75)) / grain_total
+
+    distilled_pH = 5.45 - grain_effect
+
+    RA = base_HCO3 - (base_Ca / 1.4) - (base_Mg / 1.7)
+
+    estimated_pH = distilled_pH + (RA / 100) * 0.15
+
+    st.header("🧪 Mash pH")
+
+    st.write(f"Estimated Mash pH: **{estimated_pH:.2f}**")
+
+    # -----------------------------
+    # pH VISUAL
+    # -----------------------------
+    st.markdown("### 🧪 Mash pH Visualisation")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.caption("Before Adjustment")
+        st.pyplot(plot_ph_gauge(estimated_pH))
+
+    # -----------------------------
+    # ACID
+    # -----------------------------
+    target_ph = st.sidebar.number_input("Target Mash pH", 5.0, 5.8, 5.4)
+
+    delta_pH = estimated_pH - target_ph
+    ml_per_l_per_0_1 = 0.1
+
+    base_acid_ml = max(
+        0,
+        (delta_pH / 0.1) * ml_per_l_per_0_1 * mash_water
+    )
+
+    mash_acid_ml = base_acid_ml / strength
+
+    alkalinity = base_HCO3 / 61
+    sparge_acid_ml = (alkalinity * 0.1 * sparge_water) / strength
+
+    if acid_mode == "Mash Only":
+        sparge_acid_ml = 0
+    elif acid_mode == "Sparge Only":
+        mash_acid_ml = 0
+
+    total_acid_ml = mash_acid_ml + sparge_acid_ml
+
+    st.subheader("Acid Additions")
+
+    if "powder" in acid_type.lower():
+        grams = lambda x: x * 0.96
+
+        if mash_acid_ml > 0:
+            st.write(f"Mash: **{grams(mash_acid_ml):.2f} g**")
+        if sparge_acid_ml > 0:
+            st.write(f"Sparge: **{grams(sparge_acid_ml):.2f} g**")
+        st.write(f"Total: **{grams(total_acid_ml):.2f} g**")
+
+    else:
+        if mash_acid_ml > 0:
+            st.write(f"Mash: **{mash_acid_ml:.1f} mL**")
+        if sparge_acid_ml > 0:
+            st.write(f"Sparge: **{sparge_acid_ml:.1f} mL**")
+        st.write(f"Total: **{total_acid_ml:.1f} mL**")
+
+    with col2:
+        st.caption("After Adjustment")
+        st.pyplot(plot_ph_gauge(target_ph))
+
+    st.success(f"Final Mash pH after adjustment: **{target_ph:.2f}**")
